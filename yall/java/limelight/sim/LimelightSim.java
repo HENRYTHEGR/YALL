@@ -6,6 +6,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import edu.wpi.first.apriltag.AprilTag;
 import edu.wpi.first.apriltag.AprilTagFieldLayout;
 import edu.wpi.first.apriltag.AprilTagFields;
+import edu.wpi.first.cameraserver.CameraServer;
+import edu.wpi.first.cscore.CvSource;
+import edu.wpi.first.cscore.OpenCvLoader;
 import edu.wpi.first.math.MathUtil;
 import edu.wpi.first.math.geometry.Pose2d;
 import edu.wpi.first.math.geometry.Pose3d;
@@ -26,6 +29,12 @@ import java.util.Random;
 import limelight.Limelight;
 import limelight.networktables.LimelightResults;
 import limelight.networktables.target.AprilTagFiducial;
+import org.opencv.core.CvType;
+import org.opencv.core.Mat;
+import org.opencv.core.MatOfPoint;
+import org.opencv.core.Point;
+import org.opencv.core.Scalar;
+import org.opencv.imgproc.Imgproc;
 
 /**
  * Simulates a {@link Limelight} running the AprilTag/fiducial pipeline, publishing to the same NetworkTables keys a real Limelight would populate ("tx", "ty", "ta", "tv", "tid", "botpose*",
@@ -105,6 +114,16 @@ public class LimelightSim
    * </pre>
    */
   private FieldObject2d raycasts;
+
+  /**
+   * Optional simulated camera stream, see {@link #withVideoStream()}. {@code null} when disabled.
+   */
+  private CvSource videoStream;
+
+  /**
+   * Image drawn and sent to {@link #videoStream} every {@link #update(Pose3d)}.
+   */
+  private Mat videoFrame;
 
   /**
    * Jackson mapper used to publish the "json" results entry.
@@ -267,6 +286,29 @@ public class LimelightSim
   }
 
   /**
+   * Publish a simulated camera stream showing what this Limelight "sees": every visible AprilTag drawn as a white square labeled with its ID, plus a crosshair at the image center.
+   *
+   * <p>
+   * Open it in a browser at <a href="http://localhost:1181">http://localhost:1181</a>. Each additional stream gets the next port (1182, 1183, ...) in the order they are created. The stream is also
+   * published to NetworkTables, so dashboards like Elastic, Shuffleboard and AdvantageScope can show it as well.
+   *
+   * <p>
+   * Inspired by PhotonVision's {@code PhotonCameraSim} video stream. Drawing a frame every loop costs some CPU, so this is off unless called. No-op if not running in simulation.
+   *
+   * @return {@link LimelightSim} for chaining.
+   */
+  public LimelightSim withVideoStream()
+  {
+    if (RobotBase.isSimulation() && videoStream == null)
+    {
+      OpenCvLoader.forceStaticLoad();
+      videoStream = CameraServer.putVideo(limelight.limelightName + "-sim", (int) settings.resolutionWidth, (int) settings.resolutionHeight);
+      videoFrame = new Mat();
+    }
+    return this;
+  }
+
+  /**
    * Set the camera properties/noise/latency configuration.
    *
    * @param settings {@link LimelightSimSettings} to use.
@@ -319,8 +361,9 @@ public class LimelightSim
     visible.sort((a, b) -> Double.compare(b.ta, a.ta));
 
     drawRaycasts(robotPose, visible);
+    drawVideoFrame(cameraPose, visible);
 
-    int            tagCount = visible.size();
+    int           tagCount = visible.size();
     TagObservation primary  = tagCount > 0 ? visible.get(0) : null;
 
     double avgTagDist = 0;
@@ -436,6 +479,86 @@ public class LimelightSim
     }
 
     raycasts.setPoses(poses.toArray(new Pose2d[0]));
+  }
+
+  /**
+   * Draw what the simulated camera sees and send it to the video stream, if {@link #withVideoStream()} was called.
+   *
+   * <p>
+   * Each visible tag's 4 corners are projected into the image with the same pinhole camera model used by {@link #project(Pose3d, Pose3d, AprilTag)}.
+   *
+   * @param cameraPose Camera pose on the field.
+   * @param visible    Currently visible AprilTags.
+   */
+  private void drawVideoFrame(Pose3d cameraPose, List<TagObservation> visible)
+  {
+    if (videoStream == null)
+    {
+      return;
+    }
+
+    int width  = (int) settings.resolutionWidth;
+    int height = (int) settings.resolutionHeight;
+
+    videoFrame.create(height, width, CvType.CV_8UC3);
+    videoFrame.setTo(new Scalar(40, 40, 40)); // Dark gray background (OpenCV colors are BGR).
+
+    // Focal lengths in pixels, from the field of view.
+    double fx   = (width / 2.0) / Math.tan(settings.horizontalFOV.getRadians() / 2.0);
+    double fy   = (height / 2.0) / Math.tan(settings.verticalFOV.getRadians() / 2.0);
+    double half = settings.tagSizeMeters / 2.0;
+
+    // Tag corners in the tag's own frame. A tag faces along its +X axis, so its face lies in the Y/Z plane.
+    double[][] cornerOffsets = {{-half, -half}, {half, -half}, {half, half}, {-half, half}};
+
+    Scalar green = new Scalar(0, 255, 0);
+    Scalar white = new Scalar(255, 255, 255);
+
+    for (TagObservation obs : visible)
+    {
+      Point[] pixels       = new Point[4];
+      boolean behindCamera = false;
+
+      for (int i = 0; i < 4; i++)
+      {
+        // Corner relative to the camera: X forward, Y left, Z up.
+        Translation3d corner = obs.pose.transformBy(new Transform3d(0, cornerOffsets[i][0], cornerOffsets[i][1], Rotation3d.kZero)).relativeTo(cameraPose).getTranslation();
+
+        if (corner.getX() <= 0)
+        {
+          behindCamera = true;
+          break;
+        }
+
+        // Pinhole projection. Image X grows to the right and image Y grows downward.
+        pixels[i] = new Point(width / 2.0 - fx * corner.getY() / corner.getX(), height / 2.0 - fy * corner.getZ() / corner.getX());
+      }
+
+      if (behindCamera)
+      {
+        continue;
+      }
+
+      MatOfPoint outline = new MatOfPoint(pixels);
+      Imgproc.fillConvexPoly(videoFrame, outline, white);
+      Imgproc.polylines(videoFrame, List.of(outline), true, green, 3);
+      outline.release();
+
+      // Label just above the tag's top-left.
+      Point label = new Point(width, height);
+      for (Point pixel : pixels)
+      {
+        label.x = Math.min(label.x, pixel.x);
+        label.y = Math.max(30, Math.min(label.y, pixel.y - 10)); // Keep the label on screen.
+      }
+      Imgproc.putText(videoFrame, "ID " + obs.id, label, Imgproc.FONT_HERSHEY_SIMPLEX, 1.0, green, 2);
+    }
+
+    // Crosshair.
+    Imgproc.line(videoFrame, new Point(width / 2.0 - 20, height / 2.0), new Point(width / 2.0 + 20, height / 2.0), green, 2);
+    Imgproc.line(videoFrame, new Point(width / 2.0, height / 2.0 - 20), new Point(width / 2.0, height / 2.0 + 20), green, 2);
+
+    videoStream.putFrame(videoFrame);
   }
 
   /**
