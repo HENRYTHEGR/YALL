@@ -571,6 +571,8 @@ public class LimelightSim
   {
     int width = (int) settings.resolutionWidth;
     int height = (int) settings.resolutionHeight;
+    // NOTE IM NOT SURE EXACTLY WHERE LL GETS WIERD WITH ANGLES
+    Pose3d ll_adjusted_pose = new Pose3d(cameraPose.getTranslation(), new Rotation3d(-cameraPose.getRotation().getX(), -cameraPose.getRotation().getY(), -cameraPose.getRotation().getZ()));
 
     videoFrame.create(height, width, CvType.CV_8UC3);
     videoFrame.setTo(new Scalar(40, 40, 40)); // Dark gray background (OpenCV colors are BGR).
@@ -584,7 +586,7 @@ public class LimelightSim
     {
       // The model's origin is the field center, WPILib's is the blue alliance corner.
       Pose3d fieldCenter = new Pose3d(fieldLayout.getFieldLength() / 2.0, fieldLayout.getFieldWidth() / 2.0, 0, Rotation3d.kZero);
-      fieldModel.draw(videoFrame, cameraPose.relativeTo(fieldCenter), fx, fy);
+      fieldModel.draw(videoFrame, ll_adjusted_pose.relativeTo(fieldCenter), fx, fy);
     }
 
     // Tag corners in the tag's own frame. A tag faces along its +X axis, so its face lies in the Y/Z plane.
@@ -601,7 +603,7 @@ public class LimelightSim
       for (int i = 0; i < 4; i++)
       {
         // Corner relative to the camera: X forward, Y left, Z up.
-        Translation3d corner = obs.pose.transformBy(new Transform3d(0, cornerOffsets[i][0], cornerOffsets[i][1], Rotation3d.kZero)).relativeTo(cameraPose).getTranslation();
+        Translation3d corner = obs.pose.transformBy(new Transform3d(0, cornerOffsets[i][0], cornerOffsets[i][1], Rotation3d.kZero)).relativeTo(ll_adjusted_pose).getTranslation();
 
         if (corner.getX() <= 0)
         {
