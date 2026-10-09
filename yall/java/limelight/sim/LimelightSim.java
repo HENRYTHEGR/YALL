@@ -18,14 +18,19 @@ import edu.wpi.first.math.geometry.Translation3d;
 import edu.wpi.first.networktables.DoubleArrayEntry;
 import edu.wpi.first.networktables.NetworkTable;
 import edu.wpi.first.networktables.NetworkTableEntry;
+import edu.wpi.first.wpilibj.DriverStation;
 import edu.wpi.first.wpilibj.RobotBase;
 import edu.wpi.first.wpilibj.Timer;
 import edu.wpi.first.wpilibj.smartdashboard.Field2d;
 import edu.wpi.first.wpilibj.smartdashboard.FieldObject2d;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.Random;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 import limelight.Limelight;
 import limelight.networktables.LimelightResults;
 import limelight.networktables.target.AprilTagFiducial;
@@ -124,6 +129,21 @@ public class LimelightSim
    * Image drawn and sent to {@link #videoStream} every {@link #update(Pose3d)}.
    */
   private Mat videoFrame;
+
+  /**
+   * Background thread that draws video frames, so drawing never slows down the robot loop. {@code null} when the video stream is disabled.
+   */
+  private ExecutorService videoThread;
+
+  /**
+   * Whether {@link #videoThread} is still drawing the previous frame.
+   */
+  private final AtomicBoolean drawingVideoFrame = new AtomicBoolean();
+
+  /**
+   * Optional field CAD model drawn behind the AprilTags in the video stream, see {@link #withVideoStream(String)}. {@code null} when not used.
+   */
+  private FieldModel fieldModel;
 
   /**
    * Jackson mapper used to publish the "json" results entry.
@@ -304,6 +324,40 @@ public class LimelightSim
       OpenCvLoader.forceStaticLoad();
       videoStream = CameraServer.putVideo(limelight.limelightName + "-sim", (int) settings.resolutionWidth, (int) settings.resolutionHeight);
       videoFrame = new Mat();
+      videoThread = Executors.newSingleThreadExecutor(runnable -> {
+        Thread thread = new Thread(runnable, limelight.limelightName + "-sim video");
+        thread.setDaemon(true); // Don't keep the simulation running after the robot code exits.
+        return thread;
+      });
+    }
+    return this;
+  }
+
+  /**
+   * Same as {@link #withVideoStream()}, but also draws a 3D model of the field (walls, field elements, ...) in the stream so it looks like what a real camera would see.
+   *
+   * <p>
+   * The model must be a binary STL file in meters, with its origin at the center of the field and Z pointing up. That is how FIRST's official field CAD is set up, so exporting it to STL from Onshape
+   * with units set to meters works as-is. FIRST's full CAD has millions of triangles and makes the simulation slow, so use a simplified model (around 100k triangles or fewer).
+   *
+   * <p>
+   * The model is only drawn: it does not block AprilTags or change any NetworkTables data. No-op if not running in simulation.
+   *
+   * @param stlPath Path to the field model STL file.
+   * @return {@link LimelightSim} for chaining.
+   */
+  public LimelightSim withVideoStream(String stlPath)
+  {
+    withVideoStream(); // Loads OpenCV, which FieldModel needs.
+    if (RobotBase.isSimulation())
+    {
+      try
+      {
+        fieldModel = new FieldModel(stlPath);
+      } catch (IOException e)
+      {
+        DriverStation.reportError("LimelightSim could not load field model: " + e.getMessage(), false);
+      }
     }
     return this;
   }
@@ -361,7 +415,7 @@ public class LimelightSim
     visible.sort((a, b) -> Double.compare(b.ta, a.ta));
 
     drawRaycasts(robotPose, visible);
-    drawVideoFrame(cameraPose, visible);
+    startVideoFrame(cameraPose, visible);
 
     int           tagCount = visible.size();
     TagObservation primary  = tagCount > 0 ? visible.get(0) : null;
@@ -482,7 +536,30 @@ public class LimelightSim
   }
 
   /**
-   * Draw what the simulated camera sees and send it to the video stream, if {@link #withVideoStream()} was called.
+   * If {@link #withVideoStream()} was called, start drawing a video frame on the {@link #videoThread} and return immediately, so drawing (especially a large field model) never slows down the robot
+   * loop. If the previous frame is still being drawn, this frame is skipped.
+   *
+   * @param cameraPose Camera pose on the field.
+   * @param visible    Currently visible AprilTags.
+   */
+  private void startVideoFrame(Pose3d cameraPose, List<TagObservation> visible)
+  {
+    if (videoThread != null && drawingVideoFrame.compareAndSet(false, true))
+    {
+      videoThread.execute(() -> {
+        try
+        {
+          drawVideoFrame(cameraPose, visible);
+        } finally
+        {
+          drawingVideoFrame.set(false);
+        }
+      });
+    }
+  }
+
+  /**
+   * Draw what the simulated camera sees and send it to the video stream. Runs on the {@link #videoThread}.
    *
    * <p>
    * Each visible tag's 4 corners are projected into the image with the same pinhole camera model used by {@link #project(Pose3d, Pose3d, AprilTag)}.
@@ -492,12 +569,7 @@ public class LimelightSim
    */
   private void drawVideoFrame(Pose3d cameraPose, List<TagObservation> visible)
   {
-    if (videoStream == null)
-    {
-      return;
-    }
-
-    int width  = (int) settings.resolutionWidth;
+    int width = (int) settings.resolutionWidth;
     int height = (int) settings.resolutionHeight;
 
     videoFrame.create(height, width, CvType.CV_8UC3);
@@ -507,6 +579,13 @@ public class LimelightSim
     double fx   = (width / 2.0) / Math.tan(settings.horizontalFOV.getRadians() / 2.0);
     double fy   = (height / 2.0) / Math.tan(settings.verticalFOV.getRadians() / 2.0);
     double half = settings.tagSizeMeters / 2.0;
+
+    if (fieldModel != null)
+    {
+      // The model's origin is the field center, WPILib's is the blue alliance corner.
+      Pose3d fieldCenter = new Pose3d(fieldLayout.getFieldLength() / 2.0, fieldLayout.getFieldWidth() / 2.0, 0, Rotation3d.kZero);
+      fieldModel.draw(videoFrame, cameraPose.relativeTo(fieldCenter), fx, fy);
+    }
 
     // Tag corners in the tag's own frame. A tag faces along its +X axis, so its face lies in the Y/Z plane.
     double[][] cornerOffsets = {{-half, -half}, {half, -half}, {half, half}, {-half, half}};
